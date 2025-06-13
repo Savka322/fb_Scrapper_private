@@ -3,7 +3,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial, lru_cache
 from cachetools import TTLCache
 import multiprocessing
@@ -20,17 +20,17 @@ class ResourceMonitor:
         self.start_time = time.time()
         self.start_cpu = psutil.cpu_percent()
         self.start_memory = psutil.virtual_memory().percent
-    
+
     def print_stats(self):
         elapsed = time.time() - self.start_time
         current_cpu = psutil.cpu_percent()
         current_memory = psutil.virtual_memory().percent
-        
-        print(f"\nPerformance Statistics:")
+
+        print("\nPerformance Statistics:")
         print(f"Time elapsed: {elapsed:.2f} seconds")
         print(f"CPU Usage: {current_cpu}% (change: {current_cpu - self.start_cpu:+.1f}%)")
         print(f"Memory Usage: {current_memory}% (change: {current_memory - self.start_memory:+.1f}%)")
-        
+
         try:
             gpus = GPUtil.getGPUs()
             for gpu in gpus:
@@ -47,38 +47,32 @@ class FacebookGroupScraper:
         self.driver = None
         self.url_cache = TTLCache(maxsize=1000, ttl=3600)
         self.processed_urls = set()
+        self.processed_posts = []
+        self.max_no_new_posts = 5
 
     def setup_driver(self):
         try:
             print("Configuring Chrome options...")
             options = uc.ChromeOptions()
-            
-            # GPU Acceleration
             options.add_argument("--enable-gpu")
             options.add_argument("--enable-gpu-rasterization")
             options.add_argument("--enable-zero-copy")
             options.add_argument("--enable-native-gpu-memory-buffers")
-            options.add_argument("--ignore-gpu-blocklist")
+            options.add_argument("--ignore-gpu-blacklist")
             options.add_argument("--enable-hardware-overlays")
-            
-            # Отключаем ненужные функции
             options.add_argument("--disable-software-rasterizer")
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-notifications")
-            
-            # Оптимизация памяти
             options.add_argument("--aggressive-cache-discard")
             options.add_argument("--disable-cache")
             options.add_argument("--disable-application-cache")
             options.add_argument("--disable-offline-load-stale-cache")
             options.add_argument("--disk-cache-size=0")
-            
-            # Дополнительные оптимизации
             options.add_argument("--disable-features=TranslateUI")
             options.add_argument("--disable-extensions")
             options.add_argument("--window-size=1920,1080")
-            
+
             print("Initializing WebDriver with GPU acceleration...")
             self.driver = uc.Chrome(
                 options=options,
@@ -87,8 +81,7 @@ class FacebookGroupScraper:
             self.driver.set_window_size(1920, 1080)
             self.driver.set_page_load_timeout(30)
             self.driver.implicitly_wait(1)
-            
-            # Проверяем статус GPU
+
             print("\nChecking GPU status...")
             self.driver.get('chrome://gpu')
             time.sleep(1)
@@ -97,9 +90,8 @@ class FacebookGroupScraper:
                 print(f"GPU Info:\n{gpu_info}")
             except:
                 print("Could not get GPU info")
-            
+
             print("WebDriver initialized successfully")
-            
         except Exception as e:
             print(f"Error in setup_driver: {str(e)}")
             raise
@@ -121,149 +113,195 @@ class FacebookGroupScraper:
             return None
 
     def _find_post_content(self, post):
-        """Оптимизированный поиск контента"""
         try:
-            elements = post.find_elements(By.CSS_SELECTOR, 
-                'div[data-ad-comet-preview="message"], ' +
-                'div[data-ad-preview="message"], ' +
-                'div.x1iorvi4.x1pi30zi, ' +
+            elements = post.find_elements(By.CSS_SELECTOR,
+                'div[data-ad-comet-preview="message"], '
+                'div[data-ad-preview="message"], '
+                'div.x1iorvi4.x1pi30zi, '
                 'div[role="article"] div[dir="auto"]'
             )
-            
             for element in elements:
                 if element.text.strip():
                     return element.text
         except:
             pass
-        
         return None
 
-    def _process_post_batch(self, posts):
-        """Параллельная обработка пачки постов"""
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = []
-            for post in posts:
-                post_url = self._get_post_url(post)
-                if post_url and post_url not in self.processed_urls:
-                    self.processed_urls.add(post_url)
-                    futures.append(executor.submit(self._extract_post_data, post))
-            
-            results = []
-            for future in futures:
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    print(f"Error processing post: {e}")
-            
-            return results
+    def _get_post_url(self, post):
+        try:
+            anchors = post.find_elements(By.TAG_NAME, "a")
+            for a in anchors:
+                href = a.get_attribute("href")
+                if href and "/posts/" in href:
+                    return href.split("?")[0]
+        except:
+            pass
+        return None
 
-    def _scroll_and_extract_posts(self, max_posts):
+    def expand_see_more(self, post):
+     try:
+        # Более универсальный XPATH для кнопки "ещё"
+        buttons = post.find_elements(
+            By.XPATH,
+            ".//*[self::span or self::a or self::div][contains(text(),'ещё') or contains(text(),'See more')]"
+        )
+        for btn in buttons:
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+                btn.click()
+                time.sleep(0.3)
+            except Exception:
+                pass
+     except Exception:
+        pass
+
+    def _process_post(self, post):
+     try:
+        self.expand_see_more(post)
+        post_url = self._get_post_url(post)
+        if not post_url or post_url in self.processed_urls:
+            return None
+        content = self._find_post_content(post)
+        if not content:
+            return None
+
+        # Новый способ: ищем имя и ссылку на профиль автора
+        profile_url = None
+        name = None
+        try:
+            # Обычно имя — это <strong> или <span> внутри <a> в начале поста
+            # Также часто рядом есть время — ищем <a> с видимым текстом не служебного типа
+            # Универсальный XPATH:
+            author_link = None
+            # Часто имя автора находится в h2 или div, первый <a>
+            possible_links = post.find_elements(
+                By.XPATH,
+                ".//h2//a[not(contains(@href, '/groups/')) or contains(@href, 'profile.php')] | .//strong//a | .//a[contains(@href,'facebook.com') and not(contains(text(),'Показать перевод')) and not(contains(text(),'Show translation'))]"
+            )
+            for a in possible_links:
+                n = a.text.strip()
+                if n and len(n) < 50 and "facebook.com" in (a.get_attribute("href") or "") and (
+                    "/profile.php" in (a.get_attribute("href") or "") or "/people/" in (a.get_attribute("href") or "")
+                ):
+                    author_link = a
+                    break
+            if author_link is not None:
+                profile_url = author_link.get_attribute("href")
+                name = author_link.text.strip()
+        except Exception:
+            pass
+
+        return {
+            "url": post_url,
+            "content": content,
+            "profile_url": profile_url,
+            "name": name,
+        }
+     except Exception as e:
+        print(f"Error processing post: {e}")
+        return None
+
+
+    def scroll_and_extract_posts(self, max_posts):
         posts_data = []
-        scroll_attempts = 0
-        max_scroll_attempts = 400
-        last_height = 0
-        no_change_count = 0
-        batch_size = 10
-        
-        while len(posts_data) < max_posts and scroll_attempts < max_scroll_attempts:
+        no_new_posts_count = 0
+
+        while len(posts_data) < max_posts and no_new_posts_count < self.max_no_new_posts:
             try:
                 posts = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
-                
-                # Обработка постов пакетами
-                if len(posts) > 0:
-                    new_posts = posts[len(posts_data):]
-                    if new_posts:
-                        batches = [new_posts[i:i + batch_size] for i in range(0, len(new_posts), batch_size)]
-                        for batch in batches:
-                            batch_results = self._process_post_batch(batch)
-                            posts_data.extend(batch_results)
-                            
-                            if len(posts_data) >= max_posts:
-                                break
-                            
-                            if len(posts_data) % 10 == 0:
-                                print(f"Extracted post {len(posts_data)}/{max_posts} ({(len(posts_data)/max_posts*100):.1f}%)")
-                                save_progress(posts_data, prefix="fb_group_posts_interim")
-                
-                # Быстрая прокрутка
-                self.driver.execute_script("""
-                    window.scrollTo(0, document.body.scrollHeight);
-                    window.scrollTo(0, document.body.scrollHeight - 100);
-                """)
-                time.sleep(1)
-                
-                new_height = self.driver.execute_script("return document.body.scrollHeight")
-                if new_height == last_height:
-                    no_change_count += 1
-                    if no_change_count >= 5:
-                        self.driver.execute_script("""
-                            window.scrollTo(0, document.body.scrollHeight/2);
-                            setTimeout(() => {
-                                window.scrollTo(0, document.body.scrollHeight);
-                            }, 500);
-                        """)
-                        time.sleep(2)
-                        no_change_count = 0
+                new_posts_found = 0
+                for post in posts:
+                    post_url = self._get_post_url(post)
+                    if post_url and post_url not in self.processed_urls:
+                        result = self._process_post(post)
+                        if result:
+                            self.processed_urls.add(post_url)
+                            posts_data.append(result)
+                            new_posts_found += 1
+                            print(f"Собрано постов: {len(posts_data)} / {max_posts}")
+
+                if new_posts_found == 0:
+                    no_new_posts_count += 1
                 else:
-                    no_change_count = 0
-                
-                last_height = new_height
-                scroll_attempts += 1
-                
+                    no_new_posts_count = 0
+
+                self.driver.execute_script(
+                    "window.scrollTo(0, document.body.scrollHeight);"
+                )
+                time.sleep(1)
             except Exception as e:
                 print(f"Error during scrolling: {e}")
-                scroll_attempts += 1
                 time.sleep(1)
-        
+
         return posts_data
 
-    # ... (остальные методы остаются без изменений)
+    def save_to_file(self, posts, filename_prefix="fb_group_posts"):
+        dt = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        file_path = f"{filename_prefix}_{dt}.json"
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(posts, f, ensure_ascii=False, indent=2)
+        print(f"Results saved to: {file_path}")
+        return file_path
+
+    def load_cookies(self):
+        if not os.path.exists(self.cookies_file):
+            raise FileNotFoundError(f"Cookies file '{self.cookies_file}' not found!")
+        with open(self.cookies_file, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        return cookies
+
+    def login_with_cookies(self, url):
+        self.driver.get(url)
+        cookies = self.load_cookies()
+        for cookie in cookies:
+            self.driver.add_cookie(cookie)
+        self.driver.refresh()
+        time.sleep(3)
+
+    def manual_login(self, url):
+        self.driver.get(url)
+        print("Пожалуйста, залогиньтесь вручную в открывшемся окне браузера.")
+        input("После успешного входа нажмите Enter здесь в консоли...")
 
 def main():
-    GROUP_URL = "https://www.facebook.com/groups/csgotradebuys3ll"
+    GROUP_URL = "https://www.facebook.com/groups/BHPHSuccess"
     COOKIES_FILE = "cookies.json"
-    MAX_POSTS = 1000
-    
+    MAX_POSTS = 5
+
     monitor = ResourceMonitor()
-    
-    print(f"\nStarting Facebook Group Scraper")
+
+    print("\nStarting Facebook Group Scraper")
     print(f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"User: Savka322")
+    print("User: Savka322")
     print(f"Target: {MAX_POSTS} posts")
-    
+
     print("\nInitial resource usage:")
     monitor.print_stats()
-    
+
     scraper = FacebookGroupScraper(cookies_file=COOKIES_FILE)
-    
+    posts = []
     try:
-        posts = scraper.scrape_group(GROUP_URL, max_posts=MAX_POSTS)
-        
+        scraper.setup_driver()
+        scraper.manual_login(GROUP_URL)
+        print("\nScraping posts...")
+        try:
+            posts = scraper.scroll_and_extract_posts(MAX_POSTS)
+        except KeyboardInterrupt:
+            print("\nОстановка по Ctrl+C! Сохраняем собранные посты...")
+
         if posts:
-            output_file = save_progress(posts)
-            
+            output_file = scraper.save_to_file(posts)
             print(f"\nSuccess! Scraped {len(posts)} posts")
             print(f"Results saved to: {output_file}")
-            
+
             print("\nScraping Statistics:")
             print(f"Total posts: {len(posts)}")
-            print(f"Posts with images: {len([p for p in posts if p.get('images')])}")
-            print(f"Posts with external links: {len([p for p in posts if p.get('external_links')])}")
-            
-            dates = [p['posted_time'] for p in posts if p.get('posted_time')]
-            if dates:
-                print(f"Earliest post date: {min(dates)}")
-                print(f"Latest post date: {max(dates)}")
-            
-            print(f"Unique authors: {len(set(p['author']['name'] for p in posts if p.get('author')))}")
-            
-            print("\nFinal resource usage:")
-            monitor.print_stats()
+            print(f"Unique post URLs: {len(set(p['url'] for p in posts))}")
         else:
             print("\nNo posts were scraped!")
-            
+
+        print("\nFinal resource usage:")
+        monitor.print_stats()
     except Exception as e:
         print(f"\nError during scraping: {e}")
         sys.exit(1)
